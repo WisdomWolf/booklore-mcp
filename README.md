@@ -28,6 +28,7 @@ your BookLore login (JWT, auto-refreshed).
 | `bookdrop_rescan` | write | Rescan BookLore's bookdrop folder for newly added files (staged for review) |
 | `ping` | read | Liveness + auth probe (down vs. logged-out), server version, counts |
 | `isbn_lookup` | read | Fetch metadata for an ISBN from external providers |
+| `get_chapter_text` | read | Extract the text of one or more chapters from a book's file (EPUB reliable; PDF/legacy MOBI best-effort) |
 | `fetch_metadata_candidates` | read | Fetch candidate metadata from external providers (review, then apply); per-provider status |
 | `add_tags` / `remove_tags` | write | Add/remove tags on a book (merge, idempotent) |
 | `add_categories` / `remove_categories` | write | Add/remove categories (merge, idempotent) |
@@ -64,6 +65,17 @@ without a session cookie) is distinguishable from a genuine no-match. Each candi
 carries only its own provider's fields (Amazon → `asin`/`amazonRating`, GoodReads →
 `goodreadsId`/`goodreadsRating`, Google → `googleId`), so include the provider that owns
 the field you want to fill.
+
+`get_chapter_text` downloads a book's file, detects chapter boundaries (a spine
+item / page / line whose text opens with "Chapter N", "CHAPTER N", or a bare
+number), and returns clean text for the chapter(s) you ask for — so a parent
+session can quiz on specific chapters without uploading the book. EPUB is the
+reliable path (chapter *map* cached per book_id so repeat calls skip
+re-classifying the whole book). PDF and legacy pre-KF8 MOBI files fall back to
+page/line-based text with unreliable chapter boundaries, flagged in the
+response's `warnings`; modern (KF8) MOBI files carry an embedded EPUB and use
+the reliable path automatically. Audiobooks and other non-text formats are
+rejected with a clear error. Tested against BookLore v3.2.4.
 
 ## Setup
 

@@ -17,6 +17,8 @@ import io
 import json
 import os
 import re
+import shutil
+import tempfile
 import time
 from collections import Counter
 from collections.abc import AsyncIterator
@@ -24,9 +26,13 @@ from contextlib import asynccontextmanager, suppress
 from typing import Any, Literal, get_args
 
 import httpx
+import mobi
+from bs4 import BeautifulSoup
+from ebooklib import epub
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import BaseModel
+from pypdf import PdfReader
 
 from log import configure_logging, get_logger
 
@@ -217,7 +223,12 @@ class BookLoreClient:
 
     # -- request with one auth retry ----------------------------------------
 
-    async def request(self, method: str, path: str, **kwargs: Any) -> Any:
+    async def _authed_send(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        """Send a request with a bearer token, retrying once on 401 (refresh/re-login).
+
+        Shared by `request()` (JSON/text) and `download()` (raw bytes) so both go
+        through the same auth flow.
+        """
         caller_headers = kwargs.pop("headers", {})
         token = await self._ensure_token()
         headers = {**caller_headers, "Authorization": f"Bearer {token}"}
@@ -229,6 +240,10 @@ class BookLoreClient:
             await self._reauthenticate(token)
             headers = {**caller_headers, "Authorization": f"Bearer {self._access_token}"}
             resp = await self._send(method, path, headers=headers, **kwargs)
+        return resp
+
+    async def request(self, method: str, path: str, **kwargs: Any) -> Any:
+        resp = await self._authed_send(method, path, **kwargs)
 
         if resp.status_code >= 400:
             log.warning("booklore api error", method=method, path=path, status=resp.status_code)
@@ -272,6 +287,16 @@ class BookLoreClient:
         if self._cache_ttl > 0:
             self._books_cache[with_description] = (time.monotonic(), books)
         return books
+
+    async def download(self, path: str) -> bytes:
+        """Download raw binary content (e.g. a book file) via the same auth flow
+        as `request()`, without the JSON/text decoding — the caller gets raw bytes."""
+        resp = await self._authed_send("GET", path)
+        if resp.status_code >= 400:
+            log.warning("booklore api error", method="GET", path=path, status=resp.status_code)
+            raise BookLoreError(f"GET {path} -> {resp.status_code}: download failed")
+        log.debug("booklore download", path=path, bytes=len(resp.content))
+        return resp.content
 
     async def close(self) -> None:
         """Close the underlying HTTP connection pool."""
@@ -663,6 +688,231 @@ async def _apply_patch(book_id: int, patch: dict) -> dict:
     return await client.get(f"/api/v1/books/{book_id}", params={"withDescription": "false"})
 
 
+# --- Chapter text extraction -------------------------------------------------
+
+# A segment (spine item, PDF page, or flat-text line) starts a new chapter when its
+# first non-empty line matches one of these.
+_CHAPTER_HEADING_PATTERNS = (
+    re.compile(r"^Chapter\s+\d+\b"),
+    re.compile(r"^CHAPTER\s+\d+\b"),
+    re.compile(r"^\d+$"),
+)
+
+# Per-book_id cache of chapter *maps* (heading + which segment ids make up each
+# chapter) — not chapter text, which is re-extracted on every call (see CLAUDE.md
+# non-goals: no long-term full-text caching). Keyed by book_id; invalidated whenever
+# the book's primary-file fingerprint (file id, size) changes.
+_chapter_map_cache: dict[int, dict[str, Any]] = {}
+
+
+class ChapterMapEntry(BaseModel):
+    """One detected chapter: its 1-based number, its raw heading text (empty if no
+    heading was ever matched — the whole book collapsed into one chapter), and the
+    ids of the segments (spine items / PDF pages / text lines) that make it up."""
+
+    number: int
+    heading: str
+    segment_ids: list[str]
+
+
+def _heading_line(text: str) -> str | None:
+    """Return the first non-empty line of `text` if it looks like a chapter heading,
+    else None. Only the FIRST non-empty line is checked — a heading buried mid-page
+    doesn't count as a chapter start."""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if any(p.match(line) for p in _CHAPTER_HEADING_PATTERNS):
+            return line
+        return None
+    return None
+
+
+def _build_chapter_map(segments: list[tuple[str, str]]) -> list[ChapterMapEntry]:
+    """Group ordered (segment_id, text) pairs into chapters by heading detection.
+
+    Segments that don't open with a chapter heading are merged into the nearest
+    chapter: forward into the first chapter if they precede any heading (title page,
+    copyright page), backward into the last chapter otherwise ("About the Author").
+    If no segment ever matches, the whole book collapses into a single chapter
+    (heading "") rather than raising — callers should treat that as low-confidence.
+    """
+    chapters: list[dict[str, Any]] = []
+    prefix: list[str] = []  # segment ids seen before the first detected heading
+
+    for seg_id, text in segments:
+        heading = _heading_line(text)
+        if heading is not None:
+            chapters.append({"heading": heading, "segment_ids": [seg_id]})
+        elif chapters:
+            chapters[-1]["segment_ids"].append(seg_id)
+        else:
+            prefix.append(seg_id)
+
+    if not chapters:
+        return [ChapterMapEntry(number=1, heading="", segment_ids=[s for s, _ in segments])]
+
+    chapters[0]["segment_ids"] = prefix + chapters[0]["segment_ids"]
+    return [
+        ChapterMapEntry(number=i + 1, heading=c["heading"], segment_ids=c["segment_ids"])
+        for i, c in enumerate(chapters)
+    ]
+
+
+def _epub_document_items(book: epub.EpubBook) -> dict[str, epub.EpubHtml]:
+    """Spine-ordered {idref: item} for real content documents — excludes the nav
+    document (an EpubHtml subclass) and anything not in the spine."""
+    items: dict[str, epub.EpubHtml] = {}
+    for idref, _linear in book.spine:
+        item = book.get_item_with_id(idref)
+        if isinstance(item, epub.EpubHtml) and not isinstance(item, epub.EpubNav):
+            items[idref] = item
+    return items
+
+
+def _html_to_text(raw_html: bytes) -> str:
+    return BeautifulSoup(raw_html, "html.parser").get_text("\n", strip=True)
+
+
+def _epub_segments(epub_bytes: bytes) -> tuple[epub.EpubBook, list[tuple[str, str]]]:
+    book = epub.read_epub(io.BytesIO(epub_bytes))
+    items = _epub_document_items(book)
+    return book, [(idref, _html_to_text(item.get_content())) for idref, item in items.items()]
+
+
+def _pdf_segments(pdf_bytes: bytes) -> tuple[PdfReader, list[tuple[str, str]]]:
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    return reader, [(str(i), page.extract_text() or "") for i, page in enumerate(reader.pages)]
+
+
+def _flat_text_segments(text: str) -> list[tuple[str, str]]:
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    return [(str(i), ln) for i, ln in enumerate(lines)]
+
+
+def _mobi_payload(raw: bytes) -> tuple[str, bytes | str]:
+    """Unpack a downloaded MOBI file and normalize it to ("epub"|"pdf"|"flat_text",
+    payload) — mirroring the other formats so the rest of the pipeline doesn't need
+    to know the book started as MOBI. Modern (KF8) MOBI files carry an embedded EPUB,
+    the reliable path; legacy Mobipocket (mobi7) files unpack to a single HTML
+    document with no structural chapter boundaries, so are flattened to plain text.
+    """
+    with tempfile.TemporaryDirectory(prefix="booklore-mcp-mobi-") as tmpdir:
+        mobi_path = os.path.join(tmpdir, "book.mobi")
+        with open(mobi_path, "wb") as f:
+            f.write(raw)
+        try:
+            extract_dir, extracted_path = mobi.extract(mobi_path)
+        except Exception as exc:
+            raise BookLoreError(f"Could not unpack MOBI file: {exc}") from exc
+        try:
+            if extracted_path.endswith(".epub"):
+                with open(extracted_path, "rb") as f:
+                    return "epub", f.read()
+            if extracted_path.endswith(".pdf"):
+                with open(extracted_path, "rb") as f:
+                    return "pdf", f.read()
+            with open(extracted_path, "rb") as f:
+                return "flat_text", _html_to_text(f.read())
+        finally:
+            shutil.rmtree(extract_dir, ignore_errors=True)
+
+
+def _derive_payload(book_type: str, raw: bytes) -> tuple[str, bytes | str]:
+    """Normalize a downloaded book file to (kind, payload), kind one of "epub"
+    (payload: epub bytes), "pdf" (payload: pdf bytes), or "flat_text" (payload: plain
+    text) — regardless of the book's original on-disk format."""
+    if book_type == "EPUB":
+        return "epub", raw
+    if book_type == "PDF":
+        return "pdf", raw
+    if book_type == "MOBI":
+        return _mobi_payload(raw)
+    raise BookLoreError(
+        f"Chapter text extraction isn't supported for format {book_type or 'UNKNOWN'!r}."
+    )
+
+
+def _segments_for(kind: str, payload: bytes | str) -> list[tuple[str, str]]:
+    if kind == "epub":
+        assert isinstance(payload, bytes)
+        return _epub_segments(payload)[1]
+    if kind == "pdf":
+        assert isinstance(payload, bytes)
+        return _pdf_segments(payload)[1]
+    assert isinstance(payload, str)
+    return _flat_text_segments(payload)
+
+
+def _origin_warnings(book_type: str, kind: str) -> list[str]:
+    """Warnings driven by *how* the text was obtained — computed fresh each call
+    (cheap), independent of the cached chapter map."""
+    warnings: list[str] = []
+    if book_type == "MOBI":
+        warnings.append(
+            "MOBI source: extracted via embedded EPUB"
+            if kind == "epub"
+            else "MOBI source: legacy Mobipocket fallback — no structural chapter boundaries"
+        )
+    if kind == "pdf":
+        warnings.append(
+            "PDF fallback used — chapter boundaries inferred from page text, not reliable"
+        )
+    if kind == "flat_text" and book_type != "MOBI":
+        warnings.append("flat-text fallback used — no structural chapter boundaries")
+    return warnings
+
+
+def _extract_chapter_texts(
+    kind: str, payload: bytes | str, entries: list[ChapterMapEntry]
+) -> list[str]:
+    """Pull and join the text for exactly the requested chapters' segments —
+    the only re-parsing work done on a chapter-map cache hit."""
+    wanted_ids = {sid for e in entries for sid in e.segment_ids}
+
+    if kind == "epub":
+        assert isinstance(payload, bytes)
+        book = epub.read_epub(io.BytesIO(payload))
+        items = _epub_document_items(book)
+        text_by_id = {
+            idref: _html_to_text(item.get_content())
+            for idref, item in items.items()
+            if idref in wanted_ids
+        }
+    elif kind == "pdf":
+        assert isinstance(payload, bytes)
+        reader = PdfReader(io.BytesIO(payload))
+        text_by_id = {
+            str(i): (reader.pages[i].extract_text() or "") for i in (int(sid) for sid in wanted_ids)
+        }
+    else:
+        assert isinstance(payload, str)
+        lines = [ln for ln in payload.splitlines() if ln.strip()]
+        text_by_id = {str(i): lines[i] for i in (int(sid) for sid in wanted_ids)}
+
+    return [
+        "\n\n".join(text_by_id[sid] for sid in e.segment_ids if sid in text_by_id) for e in entries
+    ]
+
+
+def _parse_chapter_request(chapter: int | list[int]) -> list[int]:
+    """Validate `chapter` and expand it to the list of 1-based chapter numbers
+    requested, in order."""
+    if isinstance(chapter, int):
+        if chapter < 1:
+            raise BookLoreError("`chapter` must be >= 1.")
+        return [chapter]
+    if isinstance(chapter, list) and len(chapter) == 2 and all(isinstance(n, int) for n in chapter):
+        start, end = chapter
+        if start < 1 or end < start:
+            raise BookLoreError(
+                f"Invalid chapter range {chapter} — expected [start, end] with 1 <= start <= end."
+            )
+        return list(range(start, end + 1))
+    raise BookLoreError(f"`chapter` must be an int or a [start, end] range, got {chapter!r}.")
+
+
 # --- MCP server -------------------------------------------------------------
 
 
@@ -772,6 +1022,78 @@ async def isbn_lookup(isbn: str) -> dict:
     (Google Books, OpenLibrary, etc.). Read-only lookup — does not modify any
     book. Use update_book_metadata to apply the result to a book."""
     return await client.post("/api/v1/metadata/isbn-lookup", json={"isbn": isbn})
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "idempotentHint": True, "title": "Get chapter text"})
+async def get_chapter_text(book_id: int, chapter: int | list[int]) -> dict:
+    """Extract the text of one or more chapters from a book's file.
+
+    `chapter` is a single chapter number, or a `[start, end]` inclusive range.
+    Chapter numbers are 1-based, assigned in reading order to detected chapter
+    starts (a spine item / PDF page / text line whose first line matches
+    "Chapter N", "CHAPTER N", or a bare number) — NOT the number printed in the
+    book's own heading text, which may be inconsistent (bind-ups, omnibus
+    editions). Front/back matter (title page, copyright, "About the Author") is
+    merged into the nearest chapter rather than returned on its own.
+
+    EPUB is the reliable path. PDF and legacy (pre-KF8) MOBI files fall back to
+    page/line-based text with unreliable chapter boundaries — check `warnings`.
+    Audiobooks and other non-text formats are rejected. The chapter *map* (not
+    the text) is cached per book_id and reused until the underlying file changes.
+    Returns {title, chapters: [{number, heading, text}], warnings}.
+    """
+    numbers = _parse_chapter_request(chapter)
+
+    book = await client.get(f"/api/v1/books/{book_id}", params={"withDescription": "false"})
+    meta = book.get("metadata") or {}
+    title = book.get("title") or meta.get("title") or f"Book {book_id}"
+    primary = book.get("primaryFile")
+    if not primary:
+        raise BookLoreError(f"Book {book_id} ({title}) has no downloadable file.")
+
+    book_type = (primary.get("bookType") or "").upper()
+    if book_type == "AUDIOBOOK":
+        raise BookLoreError(
+            f"Book {book_id} ({title}) is an audiobook — text extraction doesn't apply."
+        )
+
+    raw = await client.download(f"/api/v1/books/{book_id}/download")
+    kind, payload = _derive_payload(book_type, raw)
+
+    fingerprint = (primary.get("id"), primary.get("fileSizeKb"))
+    cached = _chapter_map_cache.get(book_id)
+    if cached and cached["fingerprint"] == fingerprint and cached["kind"] == kind:
+        chapters_map: list[ChapterMapEntry] = cached["chapters"]
+    else:
+        chapters_map = _build_chapter_map(_segments_for(kind, payload))
+        _chapter_map_cache[book_id] = {
+            "fingerprint": fingerprint,
+            "kind": kind,
+            "chapters": chapters_map,
+        }
+
+    total = len(chapters_map)
+    out_of_range = [n for n in numbers if n < 1 or n > total]
+    if out_of_range:
+        raise BookLoreError(
+            f"Book {book_id} ({title}) has {total} detected chapter(s); requested "
+            f"chapter(s) {out_of_range} out of range."
+        )
+
+    entries = [chapters_map[n - 1] for n in numbers]
+    texts = _extract_chapter_texts(kind, payload, entries)
+    warnings = _origin_warnings(book_type, kind)
+    if total == 1 and not chapters_map[0].heading:
+        warnings.append("chapter mapping uncertain — no chapter headings detected")
+
+    return {
+        "title": title,
+        "chapters": [
+            {"number": n, "heading": e.heading, "text": t}
+            for n, e, t in zip(numbers, entries, texts, strict=True)
+        ],
+        "warnings": warnings,
+    }
 
 
 # ---- Write tools -----------------------------------------------------------
