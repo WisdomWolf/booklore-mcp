@@ -48,6 +48,22 @@ async def test_list_books_filters_and_limits(authed):
     assert result.data[0].id == 1
 
 
+async def test_list_books_query_matches_series_name(authed):
+    # "The Invasion" doesn't contain "Animorphs" in its title — only findable
+    # via the series name.
+    books = [
+        {"id": 1, "title": "The Invasion", "metadata": {"seriesName": "Animorphs"}},
+        {"id": 2, "title": "Dune", "metadata": {}},
+    ]
+    authed.get(f"{BASE}/api/v1/books").mock(return_value=httpx.Response(200, json=books))
+
+    async with Client(server.mcp) as mcp_client:
+        result = await mcp_client.call_tool("list_books", {"query": "animorphs"})
+
+    assert len(result.data) == 1
+    assert result.data[0].id == 1
+
+
 async def test_update_metadata_always_sends_clear_flags(authed):
     route = authed.put(f"{BASE}/api/v1/books/5/metadata").mock(
         return_value=httpx.Response(200, json={"title": "X"})

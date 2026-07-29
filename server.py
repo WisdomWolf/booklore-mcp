@@ -402,11 +402,17 @@ _SORT_KEYS = {
 
 
 def _matches_query(book: dict, q: str) -> bool:
-    """Case-insensitive substring match over title/subtitle/isbn/author names."""
+    """Case-insensitive substring match over title/subtitle/series/isbn/author names.
+
+    Series is included because many series entries (e.g. Animorphs) don't repeat the
+    series name in the book title itself ("The Invasion", not "Animorphs: The
+    Invasion") — omitting it would make the series unsearchable by name.
+    """
     meta = book.get("metadata") or {}
     parts = [
         book.get("title") or meta.get("title"),
         meta.get("subtitle"),
+        meta.get("seriesName"),
         meta.get("isbn10"),
         meta.get("isbn13"),
         *_author_names(meta),
@@ -430,6 +436,11 @@ def _matches_filters(book: dict, filters: dict) -> bool:
     if cats := filters.get("categories"):
         have = {c.lower() for c in (meta.get("categories") or [])}
         if not ({c.lower() for c in cats} & have):
+            return False
+
+    if series := filters.get("series"):
+        name = (meta.get("seriesName") or "").lower()
+        if not any(s.lower() in name for s in series):
             return False
 
     if authors := filters.get("authors"):
@@ -947,10 +958,12 @@ mcp = FastMCP(
 async def list_books(query: str = "", limit: int = 25) -> list[BookSummary]:
     """List books in the library, optionally filtered by a keyword.
 
-    `query` is matched (case-insensitive substring) against title and author
-    names client-side; leave empty to list everything. Returns trimmed summaries
-    (id, title, authors, series, readStatus, personalRating, shelves) capped at
-    `limit`. Call get_book for full details on one book.
+    `query` is matched (case-insensitive substring) against title, series, and
+    author names client-side; leave empty to list everything. Many series entries
+    don't repeat the series name in the title itself (e.g. Animorphs' "The
+    Invasion"), so searching the series name is necessary to find them. Returns
+    trimmed summaries (id, title, authors, series, readStatus, personalRating,
+    shelves) capped at `limit`. Call get_book for full details on one book.
     """
     books = await client.get("/api/v1/books", params={"withDescription": "false"}) or []
     summaries = [_summarize_book(b) for b in books]
@@ -958,7 +971,7 @@ async def list_books(query: str = "", limit: int = 25) -> list[BookSummary]:
         q = query.lower()
 
         def matches(s: BookSummary) -> bool:
-            hay = " ".join(str(x) for x in [s.title, *(s.authors or [])] if x).lower()
+            hay = " ".join(str(x) for x in [s.title, s.series, *(s.authors or [])] if x).lower()
             return q in hay
 
         summaries = [s for s in summaries if matches(s)]
@@ -1249,10 +1262,15 @@ async def search_books(
 ) -> SearchResult:
     """Search and filter the library server-side-style, returning a paginated page.
 
-    `query` is a case-insensitive substring over title/subtitle/isbn/author names.
+    `query` is a case-insensitive substring over title/subtitle/series/isbn/author
+    names — series is included because many series entries don't repeat the series
+    name in the title itself (e.g. Animorphs' "The Invasion"), so it wouldn't be
+    findable by name otherwise.
     `filters` is an optional object:
       - tags: [str], tags_mode: "any"|"all" (default "any")
       - categories: [str] (any), authors: [str] (any, substring)
+      - series: [str] (any, substring — e.g. ["Animorphs"] matches seriesName
+        "Animorphs" or "Animorphs Graphix")
       - shelf_ids: [int], library_ids: [int]
       - read_status: "UNSET"|"READING"|"READ"|"UNREAD"|… (sparse upstream)
       - missing: subset of ["tags","categories","authors","description","isbn",

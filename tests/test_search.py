@@ -75,6 +75,20 @@ def test_matches_query_over_title_and_authors():
     assert not server._matches_query(book, "dune")
 
 
+def test_matches_query_over_series_name():
+    # Series entries often don't repeat the series name in the title itself.
+    book = {"title": "The Invasion", "metadata": {"seriesName": "Animorphs"}}
+    assert server._matches_query(book, "animorphs")
+    assert not server._matches_query(book, "goosebumps")
+
+
+def test_matches_filters_series_any_substring():
+    book = {"metadata": {"seriesName": "Animorphs Graphix"}}
+    assert server._matches_filters(book, {"series": ["Animorphs"]})
+    assert server._matches_filters(book, {"series": ["graphix"]})
+    assert not server._matches_filters(book, {"series": ["Goosebumps"]})
+
+
 # --- tool flows -------------------------------------------------------------
 
 
