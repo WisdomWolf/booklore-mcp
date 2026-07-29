@@ -1,3 +1,4 @@
 .env
+.history/
 __pycache__/
 booklore_mcp.egg-info/
