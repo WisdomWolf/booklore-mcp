@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: booklore-mcp
+  namespace: booklore-mcp
+spec:
+  type: ClusterIP
+  selector:
+    app: booklore-mcp
+  ports:
+    # Raw MCP (streamable-HTTP) — for any in-cluster MCP-native client.
+    - name: mcp
+      port: 8000
+      targetPort: mcp
+      protocol: TCP
+    # mcpo's OpenAPI bridge — what Open WebUI's Tool Server config points at.
+    - name: openapi
+      port: 9000
+      targetPort: openapi
+      protocol: TCP

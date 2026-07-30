@@ -1,0 +1,88 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: booklore-mcp
+  namespace: booklore-mcp
+  annotations:
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: booklore-mcp
+  template:
+    metadata:
+      labels:
+        app: booklore-mcp
+    spec:
+      containers:
+        - name: booklore-mcp
+          image: ghcr.io/wisdomwolf/booklore-mcp:e6d71c7941b0c26719bc9f04860136931f8d3da2
+          imagePullPolicy: Always
+          envFrom:
+            - secretRef:
+                name: booklore-mcp-secret
+          ports:
+            - name: mcp
+              containerPort: 8000
+              protocol: TCP
+          # No HTTP /health route on this server — a TCP check on the MCP port
+          # is enough to know the process is up and accepting connections.
+          readinessProbe:
+            tcpSocket:
+              port: mcp
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 1
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: mcp
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 1
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 300m
+              memory: 256Mi
+        # Bridges MCP -> OpenAPI so Open WebUI (which speaks OpenAPI tool
+        # servers, not MCP) can call this server's tools.
+        - name: mcpo
+          image: ghcr.io/open-webui/mcpo:main
+          imagePullPolicy: Always
+          args:
+            - "--port"
+            - "9000"
+            - "--server-type"
+            - "streamable-http"
+            - "--"
+            - "http://localhost:8000/mcp"
+          ports:
+            - name: openapi
+              containerPort: 9000
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: openapi
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 1
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: openapi
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 1
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
