@@ -92,6 +92,21 @@ jobs:
           uv export --frozen --no-dev --no-emit-project --format requirements-txt -o requirements.txt
           uvx pip-audit -r requirements.txt
 
+  docker:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Build-only validation — the GitHub Actions workflow is what pushes to
+      # ghcr.io (uses GITHUB_TOKEN for registry auth, which isn't available here).
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+
   all-checks:
     name: All Checks Passed
     runs-on: ubuntu-latest

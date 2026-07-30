@@ -52,11 +52,25 @@ jobs:
 
   docker:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build image
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Only push on a real merge to main (the `push` event here only fires for
+      # main per the `on.push.branches` filter above) — PR builds just validate.
+      - name: Build and push image
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: false
+          push: ${{ github.event_name == 'push' }}
+          tags: ghcr.io/wisdomwolf/booklore-mcp:${{ github.sha }}
